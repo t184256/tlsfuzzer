@@ -858,6 +858,14 @@ class CertificateVerifyGenerator(HandshakeProtocolMessageGenerator):
 
     @type signature: bytearray
     @ivar signature: bytes to sent as the signature of the message
+
+    @type padding_xors: dictionary
+    @ivar padding_xors: which bytes of the pre-encryption RSA padding or
+        post-signature ECDSA signature should be xored and with what values
+
+    @type padding_subs: dictionary
+    @ivar padding_subs: same as padding_xors but substitues specified bytes
+        instead
     """
 
     def __init__(self, private_key=None, msg_version=None, msg_alg=None,
@@ -1013,6 +1021,19 @@ class CertificateVerifyGenerator(HandshakeProtocolMessageGenerator):
             finally:
                 # make sure the changes are undone even if the signing fails
                 self.private_key._rawPrivateKeyOp = oldPrivateKeyOp
+            if self.sig_alg[1] == SignatureAlgorithm.ecdsa:
+                # because ECDSA signatures are ANS.1 DER objects, they
+                # can have different lengths depending on the bit size of
+                # "r" and "s" variables
+                # given that indexing would fail if it was asked to index
+                # over an inexistent byte, we need to limit the numbers
+                max_byte = len(signature)
+                subs = dict([(min(k, max_byte), v) for k, v in
+                             self.padding_subs.items()])
+                xors = dict([(min(k, max_byte), v) for k, v in
+                             self.padding_xors.items()])
+                signature = substitute_and_xor(signature, subs,
+                                               xors)
 
         cert_verify = CertificateVerify(self.msg_version)
         cert_verify.create(signature, self.msg_alg)
