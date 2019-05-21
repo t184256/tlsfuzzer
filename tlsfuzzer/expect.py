@@ -1015,11 +1015,12 @@ class ExpectServerKeyExchange(ExpectHandshake):
 class ExpectCertificateRequest(ExpectHandshake):
     """Processing TLS Handshake protocol Certificate Request message"""
 
-    def __init__(self, sig_algs=None):
+    def __init__(self, sig_algs=None, context=None):
         msg_type = HandshakeType.certificate_request
         super(ExpectCertificateRequest, self).__init__(ContentType.handshake,
                                                        msg_type)
         self.sig_algs = sig_algs
+        self.context = context
         # TODO: ability to verify certificate_types field
 
     def process(self, state, msg):
@@ -1043,6 +1044,8 @@ class ExpectCertificateRequest(ExpectHandshake):
                                  .format(cert_request.supported_signature_algs,
                                          self.sig_algs)
                                 )
+        if state.version >= (3, 4) and self.context is not None:
+            self.context.append(cert_request)
 
         state.handshake_messages.append(cert_request)
         state.handshake_hashes.update(msg.write())

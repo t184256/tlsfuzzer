@@ -810,12 +810,13 @@ class ClientMasterKeyGenerator(HandshakeProtocolMessageGenerator):
 class CertificateGenerator(HandshakeProtocolMessageGenerator):
     """Generator for TLS handshake protocol Certificate message."""
 
-    def __init__(self, certs=None, cert_type=None, version=None):
+    def __init__(self, certs=None, cert_type=None, version=None, context=None):
         """Set the certificates to send to server."""
         super(CertificateGenerator, self).__init__()
         self.certs = certs
         self.cert_type = cert_type
         self.version = version
+        self.context = context
 
     def generate(self, status):
         """Create a Certificate message."""
@@ -823,8 +824,15 @@ class CertificateGenerator(HandshakeProtocolMessageGenerator):
             self.version = status.version
         if self.cert_type is None:
             self.cert_type = CertificateType.x509
+        context = b''
+        if self.context:
+            context = self.context[-1]
+            assert isinstance(context, CertificateRequest)
+            context = context.certificate_request_context
         cert = Certificate(self.cert_type, version=self.version)
-        cert.create(self.certs)
+        cert.create(self.certs, context=context)
+        if self.context:
+            self.context.append(cert)
 
         self.msg = cert
         return cert
@@ -871,7 +879,7 @@ class CertificateVerifyGenerator(HandshakeProtocolMessageGenerator):
     def __init__(self, private_key=None, msg_version=None, msg_alg=None,
                  sig_version=None, sig_alg=None, signature=None,
                  rsa_pss_salt_len=None, padding_xors=None, padding_subs=None,
-                 mgf1_hash=None):
+                 mgf1_hash=None, context=None):
         """Create object for generating Certificate Verify messages."""
         super(CertificateVerifyGenerator, self).__init__()
         self.private_key = private_key
@@ -884,6 +892,7 @@ class CertificateVerifyGenerator(HandshakeProtocolMessageGenerator):
         self.padding_xors = padding_xors
         self.padding_subs = padding_subs
         self.mgf1_hash = mgf1_hash
+        self.context = context
 
     def _select_sig_alg(self, cert_req):
         for sig in cert_req.supported_signature_algs:
@@ -935,7 +944,12 @@ class CertificateVerifyGenerator(HandshakeProtocolMessageGenerator):
         if self.sig_version is None:
             self.sig_version = self.msg_version
         if self.msg_alg is None and self.msg_version >= (3, 3):
-            cert_req = status.get_last_message_of_type(CertificateRequest)
+            if self.context:
+                # do post-handshake authentication from TLS 1.3
+                cert_req = self.context[0]
+                assert isinstance(cert_req, CertificateRequest)
+            else:
+                cert_req = status.get_last_message_of_type(CertificateRequest)
             if cert_req is not None:
                 if not self.private_key:
                     # when sending malformed messages, the key may not be
@@ -959,10 +973,19 @@ class CertificateVerifyGenerator(HandshakeProtocolMessageGenerator):
             if self.private_key is None:
                 raise ValueError("Can't create a signature without "
                                  "private key!")
+            if self.context:
+                # if we have context set, it means we're doing post handshake
+                # authentication in TLS 1.3
+                handshake_hashes = \
+                    status.key['client finished handshake hashes'].copy()
+                for ctx in self.context:
+                    handshake_hashes.update(ctx.write())
+            else:
+                handshake_hashes = status.handshake_hashes
 
             verify_bytes = \
                 KeyExchange.calcVerifyBytes(self.sig_version,
-                                            status.handshake_hashes,
+                                            handshake_hashes,
                                             self.sig_alg,
                                             status.key['premaster_secret'],
                                             status.client_random,
@@ -1042,6 +1065,8 @@ class CertificateVerifyGenerator(HandshakeProtocolMessageGenerator):
 
         cert_verify = CertificateVerify(self.msg_version)
         cert_verify.create(signature, self.msg_alg)
+        if self.context:
+            self.context.append(cert_verify)
 
         self.msg = cert_verify
         return cert_verify
@@ -1129,7 +1154,7 @@ class FinishedGenerator(HandshakeProtocolMessageGenerator):
 
     def __init__(self, protocol=None,
                  trunc_start=0, trunc_end=None,
-                 pad_byte=0, pad_left=0, pad_right=0):
+                 pad_byte=0, pad_left=0, pad_right=0, context=None):
         """Object to generate Finished messages."""
         super(FinishedGenerator, self).__init__()
         self.protocol = protocol
@@ -1139,6 +1164,7 @@ class FinishedGenerator(HandshakeProtocolMessageGenerator):
         self.pad_byte = pad_byte
         self.pad_left = pad_left
         self.pad_right = pad_right
+        self.context = context
 
     def generate(self, status):
         """Create a Finished message."""
@@ -1161,13 +1187,25 @@ class FinishedGenerator(HandshakeProtocolMessageGenerator):
                                        status.client)
         else:  # TLS 1.3
             finished = Finished(self.protocol, status.prf_size)
+            if self.context:
+                # post-handshake authentication in TLS 1.3
+                base_key = status.key['client application traffic secret']
+            else:
+                base_key = status.key['client handshake traffic secret']
             finished_key = HKDF_expand_label(
-                status.key['client handshake traffic secret'],
+                base_key,
                 b'finished',
                 b'',
                 status.prf_size,
                 status.prf_name)
-            self.server_finish_hh = status.handshake_hashes.copy()
+            if self.context:
+                # post-handshake authentication in TLS 1.3
+                self.server_finish_hh = \
+                    status.key['client finished handshake hashes'].copy()
+                for ctx in self.context:
+                    self.server_finish_hh.update(ctx.write())
+            else:
+                self.server_finish_hh = status.handshake_hashes.copy()
             verify_data = secureHMAC(
                 finished_key,
                 self.server_finish_hh.digest(status.prf_name),
@@ -1193,6 +1231,9 @@ class FinishedGenerator(HandshakeProtocolMessageGenerator):
         """Perform post-transmit changes needed by generation of Finished."""
         super(FinishedGenerator, self).post_send(status)
 
+        if self.context:
+            return
+
         # resumption finished
         status.resuming = False
 
@@ -1208,6 +1249,9 @@ class FinishedGenerator(HandshakeProtocolMessageGenerator):
         res_ms = derive_secret(secret, b'res master', status.handshake_hashes,
                                status.prf_name)
         status.key['resumption master secret'] = res_ms
+        # preserve the hash state for post-handshake authentication
+        status.key['client finished handshake hashes'] = \
+            status.handshake_hashes.copy()
 
 
 class AlertGenerator(MessageGenerator):
